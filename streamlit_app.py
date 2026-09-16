@@ -1,12 +1,22 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# CBC Thalassemia 4-Class Classifier — Streamlit UI
+# CBC Thalassemia 4-Class Classifier — Streamlit UI  (v2 bundle compatible)
 # Deploy: streamlit.io (Community Cloud — free)
 # Model stored on HuggingFace Hub (no 25 MB GitHub limit)
+#
+# v2 Changes vs v1:
+#   • Adds imputer step (train-fitted SimpleImputer, no data leakage)
+#   • Clips negative CBC values before imputation
+#   • bundle key 'best_idxs' → 'best_feat_idxs'
+#   • Metrics now in bundle['test_metrics'] dict; also reads external results
+#   • SHAP handles both old list API and new 3D ndarray (≥0.44)
+#   • np.ravel() on predict() output (CatBoost returns (n,1) shape)
+#   • LIME removed (not included in v2 bundle)
+#   • Adds external validation tab with comparison table
 # ══════════════════════════════════════════════════════════════════════════════
 
 from __future__ import annotations
 import os, pickle, warnings, io
-from typing import Optional, Dict
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -20,17 +30,15 @@ warnings.filterwarnings('ignore')
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Load model bundle from Hugging Face Hub
-#    ↓ Change HF_USERNAME to your actual Hugging Face username
 # ══════════════════════════════════════════════════════════════════════════════
-HF_USERNAME  = "Chollanot"                 # ← your HuggingFace username
+HF_USERNAME  = "Chollanot"
 HF_REPO_ID   = f"{HF_USERNAME}/cbc-thalassemia-model"
 BUNDLE_CACHE = "/tmp/model_bundle.pkl"
 
 @st.cache_resource(show_spinner="Loading model from Hugging Face Hub...")
 def load_bundle():
-    # Download only once per session; cached in /tmp after that
     if not os.path.exists(BUNDLE_CACHE):
-        local_path = hf_hub_download(
+        hf_hub_download(
             repo_id   = HF_REPO_ID,
             filename  = "model_bundle.pkl",
             repo_type = "dataset",
@@ -39,31 +47,38 @@ def load_bundle():
     with open(BUNDLE_CACHE, 'rb') as fh:
         return pickle.load(fh)
 
-bundle         = load_bundle()
-BEST_MODEL     = bundle['model']
-fitted_scaler  = bundle['scaler']
-LOG_FEATS      = bundle['log_feats']
-ALL_FEATURES   = bundle['all_features']
-BEST_FEATS     = bundle['best_features']
-BEST_IDXS      = bundle['best_idxs']
-shap_explainer = bundle.get('shap_explainer')
-lime_explainer = bundle.get('lime_explainer')
-CLASS_NAMES    = bundle['class_names']
-N_CLASSES      = bundle['n_classes']
-feat_names     = BEST_FEATS
+bundle          = load_bundle()
+BEST_MODEL      = bundle['model']
+fitted_scaler   = bundle['scaler']
+fitted_imputer  = bundle['imputer']                            # NEW v2
+ALL_FEATURES    = bundle['all_features']
+BEST_FEATS      = bundle['best_features']
+# Key renamed in v2: best_idxs → best_feat_idxs
+BEST_IDXS       = bundle.get('best_feat_idxs', bundle.get('best_idxs', []))
+shap_explainer  = bundle.get('shap_explainer')
+CLASS_NAMES     = bundle['class_names']
+N_CLASSES       = bundle['n_classes']
+feat_names      = BEST_FEATS
 
 classifier_name = bundle.get('classifier',  'Random Forest')
 resampling_name = bundle.get('resampling',  'No Resampling')
 feature_set     = bundle.get('feature_set', 'Top-12')
-acc       = float(bundle.get('accuracy',    0.0))
-f1        = float(bundle.get('f1',          0.0))
-mcc       = float(bundle.get('mcc',         0.0))
-auc_roc   = float(bundle.get('auc_roc',     0.0))
-auc_pr    = float(bundle.get('auc_pr',      0.0))
-mean_sens = float(bundle.get('sensitivity', 0.0))
 
-SHAP_OK = shap_explainer is not None
-LIME_OK = lime_explainer is not None
+# Metrics — v2 stores in test_metrics dict; fall back to flat keys for compat
+_tm      = bundle.get('test_metrics', {})
+acc      = float(_tm.get('accuracy',    bundle.get('accuracy',    0.0)))
+f1       = float(_tm.get('f1',          bundle.get('f1',          0.0)))
+mcc      = float(_tm.get('mcc',         bundle.get('mcc',         0.0)))
+gm       = float(_tm.get('gmean',       bundle.get('gmean',       0.0)))
+auc_roc  = float(_tm.get('auc_roc',     bundle.get('auc_roc',     0.0)))
+auc_pr   = float(_tm.get('auc_pr',      bundle.get('auc_pr',      0.0)))
+mean_sens= float(_tm.get('sensitivity', bundle.get('sensitivity', 0.0)))
+mean_spec= float(_tm.get('specificity', bundle.get('specificity', 0.0)))
+
+# External validation metrics (added by pipeline v2 Section 19–20)
+_em      = bundle.get('ext_metrics', {})
+
+SHAP_OK  = shap_explainer is not None
 
 RAW_DEFAULTS: Dict[str, float] = {
     'Age': 30.0, 'Sex': 0.0,
@@ -104,18 +119,19 @@ def _build_raw(data: dict) -> dict:
 
 
 def _preprocess(raw_dict: dict) -> np.ndarray:
+    """Preprocessing pipeline matching CBC_4Class_Full_Pipeline_v2.py exactly:
+       clip negatives → impute (train medians) → scale → select features."""
     row_df = pd.DataFrame([raw_dict])[ALL_FEATURES].copy()
-    for f in LOG_FEATS:
-        if f in row_df.columns:
-            row_df[f] = np.log1p(row_df[f].clip(lower=0))
-    scaled   = fitted_scaler.transform(row_df)
-    return scaled[0, BEST_IDXS]
+    row_df = row_df.clip(lower=0)                            # clip negatives
+    imp_arr = fitted_imputer.transform(row_df)               # impute
+    scaled  = fitted_scaler.transform(imp_arr)               # scale
+    return scaled[0, list(BEST_IDXS)]                        # select features
 
 
 def _predict_one(raw: dict) -> dict:
     sample = _preprocess(raw)
     X_in   = sample.reshape(1, -1)
-    pred   = int(BEST_MODEL.predict(X_in)[0])
+    pred   = int(np.ravel(BEST_MODEL.predict(X_in))[0])      # np.ravel for CatBoost
     probs  = BEST_MODEL.predict_proba(X_in)[0].tolist()
     return {
         'predicted_class':      pred,
@@ -155,7 +171,11 @@ def _shap_fig(sample: np.ndarray, pred_cls: int) -> plt.Figure:
         return fig
     try:
         sv_all = shap_explainer.shap_values(sample.reshape(1, -1))
-        sv = sv_all[pred_cls][0] if isinstance(sv_all, list) else sv_all[0]
+        # Handle both old list API (<0.44) and new 3D ndarray (≥0.44)
+        if isinstance(sv_all, list):
+            sv = sv_all[pred_cls][0]          # list of (1, n_feat) per class
+        else:
+            sv = sv_all[0, :, pred_cls]       # (1, n_feat, n_cls)[0] → (n_feat,)
         if hasattr(sv, 'ndim') and sv.ndim > 1:
             sv = sv.flatten()
         order  = np.argsort(np.abs(sv))[::-1][:10]
@@ -179,37 +199,6 @@ def _shap_fig(sample: np.ndarray, pred_cls: int) -> plt.Figure:
         return fig
 
 
-def _lime_fig(sample: np.ndarray, pred_cls: int) -> plt.Figure:
-    if not LIME_OK:
-        fig, ax = plt.subplots(figsize=(5, 2))
-        ax.text(0.5, 0.5, 'LIME explainer not available',
-                ha='center', va='center', fontsize=11, color='gray')
-        ax.axis('off')
-        return fig
-    try:
-        exp = lime_explainer.explain_instance(
-            sample, BEST_MODEL.predict_proba, num_features=8, labels=[pred_cls])
-        fc  = exp.as_list(label=pred_cls)
-        fl  = [c[0][:35] for c in fc]
-        fv  = [c[1] for c in fc]
-        clr = ['#E91E63' if v > 0 else '#2196F3' for v in fv]
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.barh(fl[::-1], fv[::-1], color=clr[::-1], edgecolor='white')
-        ax.axvline(0, color='black', lw=0.8)
-        ax.set_xlabel('LIME contribution', fontsize=9)
-        ax.set_title(f'LIME — {CLASS_NAMES.get(pred_cls, str(pred_cls))}',
-                     fontweight='bold', fontsize=10)
-        ax.grid(axis='x', alpha=0.3)
-        plt.tight_layout()
-        return fig
-    except Exception as e:
-        fig, ax = plt.subplots(figsize=(5, 2))
-        ax.text(0.5, 0.5, f'LIME error: {e}', ha='center', va='center',
-                fontsize=9, color='red')
-        ax.axis('off')
-        return fig
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. Streamlit page config
 # ══════════════════════════════════════════════════════════════════════════════
@@ -224,7 +213,7 @@ st.markdown("""
             border-radius:12px;padding:18px 24px;margin-bottom:16px">
   <h1 style="color:white;margin:0;font-size:1.6em">🩸 CBC Thalassemia 4-Class Classifier</h1>
   <p style="color:rgba(255,255,255,0.85);margin:4px 0 0">
-    Explainable AI · Raw CBC → Prediction + SHAP + LIME
+    Explainable AI · Raw CBC → Prediction + SHAP
   </p>
 </div>
 """, unsafe_allow_html=True)
@@ -260,7 +249,7 @@ with tab1:
         mch  = c1.number_input('MCH (pg)',        min_value=10.0, max_value=50.0,  value=27.0)
         mchc = c2.number_input('MCHC (g/dL)',     min_value=20.0, max_value=45.0,  value=33.0)
 
-        with st.expander('⚙️ WBC Differential (optional)'):
+        with st.expander('⚙️ WBC Differential (optional — defaults used if blank)'):
             d1, d2, d3 = st.columns(3)
             rdw   = d1.number_input('RDW (%)',       value=13.0)
             plt_v = d2.number_input('PLT (×10³/µL)', value=277.0)
@@ -319,19 +308,14 @@ with tab1:
 
     if predict_btn:
         st.markdown('---')
-        sh_col, li_col = st.columns(2)
-        with sh_col:
-            st.markdown('**SHAP — Feature Contributions**')
-            st.pyplot(_shap_fig(sample, pred))
-        with li_col:
-            st.markdown('**LIME — Local Explanation**')
-            st.pyplot(_lime_fig(sample, pred))
+        st.markdown('**SHAP — Feature Contributions**')
+        st.pyplot(_shap_fig(sample, pred))
 
 # ── TAB 2 — Batch prediction ──────────────────────────────────────────────────
 with tab2:
     st.markdown("""
 Upload a **.xlsx** or **.csv** file.
-Required columns: `Sex, RBC, HGB, HCT, MCV, MCH, MCHC`
+**Required columns:** `Sex, RBC, HGB, HCT, MCV, MCH, MCHC`
 Optional: `Age, RDW, PLT, WBC, NEU, absNEU, LYMP, absLYMP, MONO, absMONO, EOS, absEOS, BASO, absBASO`
 """)
 
@@ -398,7 +382,6 @@ Optional: `Age, RDW, PLT, WBC, NEU, absNEU, LYMP, absLYMP, MONO, absMONO, EOS, a
                 columns={'Predicted_Class': 'Class', 'count': 'Count'}
             ).to_excel(writer, sheet_name='Summary', index=False)
         out_buf.seek(0)
-
         st.download_button('⬇️ Download Full Results (.xlsx)', out_buf,
                            file_name='Batch_Predictions.xlsx',
                            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
@@ -414,16 +397,37 @@ with tab3:
 | **Feature set** | {feature_set} ({len(BEST_FEATS)} features) |
 | **Features** | {', '.join(BEST_FEATS)} |
 
-## Test-Set Performance
+## Internal Test-Set Performance
 | Metric | Score |
 |:---|:---:|
 | Accuracy | {acc:.4f} |
 | F1 (macro) | {f1:.4f} |
 | **★ MCC** | **{mcc:.4f}** |
+| G-mean | {gm:.4f} |
 | AUC-ROC | {auc_roc:.4f} |
 | **★ AUC-PR** | **{auc_pr:.4f}** |
 | Sensitivity (macro) | {mean_sens:.4f} |
+| Specificity (macro) | {mean_spec:.4f} |
+""")
 
+    if _em:
+        st.markdown(f"""
+## External Validation (n = 625)
+| Metric | Internal | External |
+|:---|:---:|:---:|
+| Accuracy | {acc:.4f} | {_em.get('accuracy', float('nan')):.4f} |
+| F1 (macro) | {f1:.4f} | {_em.get('f1', float('nan')):.4f} |
+| MCC | {mcc:.4f} | {_em.get('mcc', float('nan')):.4f} |
+| G-mean | {gm:.4f} | {_em.get('gmean', float('nan')):.4f} |
+| AUC-ROC | {auc_roc:.4f} | {_em.get('auc_roc', float('nan')):.4f} |
+| AUC-PR | {auc_pr:.4f} | {_em.get('auc_pr', float('nan')):.4f} |
+| Sensitivity | {mean_sens:.4f} | {_em.get('sensitivity', float('nan')):.4f} |
+| Specificity | {mean_spec:.4f} | {_em.get('specificity', float('nan')):.4f} |
+""")
+    else:
+        st.info('External validation metrics will appear here after running pipeline v2 Section 19.')
+
+    st.markdown("""
 ## Dataset
 | | |
 |:---|:---|
