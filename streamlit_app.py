@@ -31,26 +31,31 @@ warnings.filterwarnings('ignore')
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Load model bundle from Hugging Face Hub
 # ══════════════════════════════════════════════════════════════════════════════
-HF_USERNAME  = "Chollanot"
-HF_REPO_ID   = f"{HF_USERNAME}/cbc-thalassemia-model"
-BUNDLE_CACHE = "/tmp/model_bundle.pkl"
+HF_USERNAME    = "Chollanot"
+HF_REPO_ID     = f"{HF_USERNAME}/cbc-thalassemia-model"
+BUNDLE_CACHE   = "/tmp/model_bundle.pkl"
+# Bump this string whenever a new bundle is uploaded to HF Hub →
+# forces Streamlit to re-download instead of using the /tmp cache
+BUNDLE_VERSION = "v2"
 
 @st.cache_resource(show_spinner="Loading model from Hugging Face Hub...")
-def load_bundle():
-    if not os.path.exists(BUNDLE_CACHE):
-        hf_hub_download(
-            repo_id   = HF_REPO_ID,
-            filename  = "model_bundle.pkl",
-            repo_type = "dataset",
-            local_dir = "/tmp",
-        )
+def load_bundle(version: str = BUNDLE_VERSION):
+    # Delete stale cache so new bundle is always pulled on version bump
+    if os.path.exists(BUNDLE_CACHE):
+        os.remove(BUNDLE_CACHE)
+    hf_hub_download(
+        repo_id   = HF_REPO_ID,
+        filename  = "model_bundle.pkl",
+        repo_type = "dataset",
+        local_dir = "/tmp",
+    )
     with open(BUNDLE_CACHE, 'rb') as fh:
         return pickle.load(fh)
 
 bundle          = load_bundle()
 BEST_MODEL      = bundle['model']
 fitted_scaler   = bundle['scaler']
-fitted_imputer  = bundle['imputer']                            # NEW v2
+fitted_imputer  = bundle.get('imputer')                        # None if old bundle
 ALL_FEATURES    = bundle['all_features']
 BEST_FEATS      = bundle['best_features']
 # Key renamed in v2: best_idxs → best_feat_idxs
@@ -120,11 +125,15 @@ def _build_raw(data: dict) -> dict:
 
 def _preprocess(raw_dict: dict) -> np.ndarray:
     """Preprocessing pipeline matching CBC_4Class_Full_Pipeline_v2.py exactly:
-       clip negatives → impute (train medians) → scale → select features."""
+       clip negatives → impute (train medians) → scale → select features.
+       Falls back to direct scaling if bundle is from v1 (no imputer)."""
     row_df = pd.DataFrame([raw_dict])[ALL_FEATURES].copy()
     row_df = row_df.clip(lower=0)                            # clip negatives
-    imp_arr = fitted_imputer.transform(row_df)               # impute
-    scaled  = fitted_scaler.transform(imp_arr)               # scale
+    if fitted_imputer is not None:
+        arr = fitted_imputer.transform(row_df)               # v2: impute first
+    else:
+        arr = row_df.values                                  # v1 fallback
+    scaled = fitted_scaler.transform(arr)                    # scale
     return scaled[0, list(BEST_IDXS)]                        # select features
 
 
